@@ -1,0 +1,8 @@
+build/
+zig-out/
+.zig-cache/
+CMakeLists.txt
+__cmake_systeminformation/
+
+sdkconfig
+sdkconfig.old
