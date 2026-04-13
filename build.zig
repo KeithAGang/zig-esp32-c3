@@ -7,6 +7,9 @@ pub fn build(b: *std.Build) void {
         .os_tag = .linux,
         .abi = .musl,
         .cpu_model = .{ .explicit = &std.Target.riscv.cpu.esp32c3 },
+        // ESP32-P4 has an FPU — tell Zig to use single-precision hard float
+        // so the output matches ESP-IDF's -mabi=ilp32f object
+
     });
 
     const lib = b.addLibrary(.{
@@ -23,31 +26,15 @@ pub fn build(b: *std.Build) void {
     lib.root_module.addCMacro("ESP_PLATFORM", "1");
     lib.root_module.addCMacro("__IEEE_LITTLE_ENDIAN", "1");
     lib.root_module.addCMacro("FORCE_INLINE_ATTR", "static inline");
-    // wint_t is expected to be pre-defined by the compiler before newlib's
-    // sys/_types.h uses it. Musl-mode clang doesn't provide it, so define it
-    // explicitly. On riscv32 newlib it's always unsigned int (32-bit).
     lib.root_module.addCMacro("__WINT_TYPE__", "unsigned int");
+    lib.root_module.addCMacro("_WINT_T_DECLARED", "1");
+    lib.root_module.addCMacro("wint_t", "unsigned int");
+    lib.root_module.addCMacro("ESP_IDF_RISCV_COMPAT", "1");
 
-    // In build.zig, add these two lines with the other macros:
-    lib.root_module.addCMacro("_WINT_T_DECLARED", "1"); // tells newlib "wint_t already exists, skip redeclaration"
-    lib.root_module.addCMacro("wint_t", "unsigned int"); // provides the actual type
-
-    // THE REAL FIX: esp_cpu.h contains inline bodies that call rv_utils_* and
-    // esprv_* functions, but it includes those headers AFTER using them.
-    // Clang (unlike GCC with its sysroot/specs) sees implicit declarations first,
-    // then the real static-inline definitions, and flags "redefinition".
-    //
-    // Solution: add a cImport prefix header that pulls in the riscv headers
-    // FIRST, so by the time esp_cpu.h's inline bodies are parsed, the functions
-    // are already declared with the correct types.
-    lib.root_module.addCMacro(
-        "ESP_IDF_RISCV_COMPAT",
-        "1",
-    );
-
-    // Newlib path must be first
-    lib.root_module.addIncludePath(.{ .cwd_relative = "/home/keithgang/.espressif/tools/riscv32-esp-elf/esp-15.2.0_20251204/riscv32-esp-elf/riscv32-esp-elf/include" });
-    lib.root_module.addIncludePath(.{ .cwd_relative = "/home/keithgang/.espressif/v6.0/esp-idf/components/newlib/platform_include" });
+    // These paths come from main/paths.zig, which is generated at build time
+    // by generate_paths.py. Never hardcoded, never committed, always correct.
+    lib.root_module.addIncludePath(.{ .cwd_relative = idf_data.newlib_include });
+    lib.root_module.addIncludePath(.{ .cwd_relative = idf_data.newlib_platform });
 
     for (idf_data.include_paths) |path| {
         lib.root_module.addIncludePath(.{ .cwd_relative = path });
