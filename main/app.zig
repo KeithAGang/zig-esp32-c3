@@ -1,139 +1,122 @@
 const std = @import("std");
+const c = @import("idf_c.zig").c;
+const uart = @import("uart.zig");
 
-const idf = @cImport({
-    // wint_t isn't injected by musl-mode clang before newlib's sys/_types.h
-    @cDefine("wint_t", "unsigned int");
-    // riscv pre-includes (from previous fix)
-    @cInclude("riscv/rv_utils.h");
-    @cInclude("riscv/interrupt.h");
-    @cInclude("esp_private/interrupt_intc.h");
-    // your actual includes
-    @cInclude("freertos/FreeRTOS.h");
-    @cInclude("freertos/task.h");
-    @cInclude("esp_log.h");
-});
-
-const TAG = "DOD_Hydro";
-
-// 1. DATA DEFINITIONS (The Shape of our System)
-// ============================================================================
-
-// The raw data coming from the outside world.
-const SensorSnapshot = extern struct {
-    ph_value: f32,
-    tick_timestamp: u32,
-};
-
-// The explicit commands our system can generate.
-// We use a strictly typed enum rather than boolean flags.
-const PumpCommand = enum(u8) {
-    StartPumping,
-    WaitAndRest,
-    SystemIdle,
-};
-
-// Global queue handle. This is the pipeline connecting our transforms.
-var sensor_queue: idf.QueueHandle_t = null;
+extern "c" fn esp_get_free_heap_size() u32;
 
 // ============================================================================
-// 2. PURE DATA TRANSFORMATIONS (The Logic)
+// DOD STATE MANAGEMENT
 // ============================================================================
-// Notice this function does NOT touch hardware, Queues, or RTOS APIs.
-// It takes data in, and returns data out. It is trivially unit-testable.
+// We explicitly define our data requirements.
+const MAX_CMD_LEN = 64;
+const HISTORY_SIZE = 5;
 
-fn evaluate_hydroponics_policy(ph: f32) PumpCommand {
-    if (ph >= 4.5 and ph <= 6.0) {
-        return .StartPumping;
+// The clay.h pattern: we know EXACTLY how many bytes this system needs.
+// 5 strings of 64 bytes = 320 bytes. We add a little overhead for the ArrayList pointers.
+const REPL_MEMORY_REQUIREMENT = (MAX_CMD_LEN * HISTORY_SIZE) + 128;
+
+const ReplState = struct {
+    allocator: std.mem.Allocator,
+    history: std.ArrayList([]const u8), // Zig's dynamic array, but backed by our safe memory!
+
+    pub fn init(allocator: std.mem.Allocator) ReplState {
+        return .{
+            .allocator = allocator,
+            .history = .empty,
+        };
     }
 
-    return .SystemIdle;
-}
+    pub fn saveCommand(self: *ReplState, cmd: []const u8) void {
+        if (cmd.len == 0) return;
 
-fn read_hardware_ph() f32 {
-    const values = [6]f32{ 3.3, 5.2, 4.5, 6.0, 5.7, 7.9 };
-    const tick = asm volatile ("csrr %[ret], mcycle"
-        : [ret] "=r" (-> u32),
-    );
-    return values[tick % 6];
-}
+        // Duplicate the string into our memory pool
+        const cmd_copy = self.allocator.dupe(u8, cmd) catch return;
 
-// ============================================================================
-// 3. SYSTEM NODES (The FreeRTOS Tasks that route the data)
-// ============================================================================
-
-// SYSTEM A: Data Ingestion
-// Goal: Translate physical world -> SensorSnapshot -> Push to Queue
-export fn ingest_system_task(arg: ?*anyopaque) callconv(.c) void {
-    _ = arg;
-    const sample_rate_ticks = 10000 / idf.portTICK_PERIOD_MS; // 10 seconds
-
-    while (true) {
-        var snapshot = SensorSnapshot{ .ph_value = read_hardware_ph(), .tick_timestamp = idf.xTaskGetTickCount() };
-
-        // Push data into the pipeline. Pass-by-copy means the downstream system
-        // owns this data completely once it's in the queue.
-        if (idf.xQueueSend(sensor_queue, &snapshot, 0) != idf.pdPASS) {
-            idf.esp_log_write(idf.ESP_LOG_ERROR, TAG, "Pipeline congested! Dropped snapshot.\n");
+        // If history is full, remove the oldest command (FIFO)
+        if (self.history.items.len >= HISTORY_SIZE) {
+            const old_cmd = self.history.orderedRemove(0);
+            self.allocator.free(old_cmd);
         }
 
-        idf.vTaskDelay(sample_rate_ticks);
+        self.history.append(self.allocator, cmd_copy) catch return;
+    }
+
+    pub fn printHistory(self: *ReplState) void {
+        uart.Terminal.print("\r\n--- Command History ---\r\n");
+        for (self.history.items, 0..) |cmd, i| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "[{d}] {s}\r\n", .{ i, cmd }) catch continue;
+            uart.Terminal.print(msg);
+        }
+    }
+};
+
+// ============================================================================
+// COMMAND PARSER
+// ============================================================================
+fn execute_command(state: *ReplState, cmd: []const u8) void {
+    if (cmd.len == 0) return;
+
+    // Save every valid command to our FBA-backed history
+    state.saveCommand(cmd);
+
+    if (std.mem.eql(u8, cmd, "help")) {
+        uart.Terminal.print("\r\nCommands: help, free, history, clear\r\n");
+    } else if (std.mem.eql(u8, cmd, "history")) {
+        state.printHistory();
+    } else if (std.mem.eql(u8, cmd, "free")) {
+        const free_ram = esp_get_free_heap_size();
+        var buf: [64]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "\r\nFree OS Heap: {d} bytes\r\n", .{free_ram}) catch "";
+        uart.Terminal.print(msg);
+    } else if (std.mem.eql(u8, cmd, "clear")) {
+        uart.Terminal.print("\x1B[2J\x1B[H");
+    } else {
+        uart.Terminal.print("\r\nUnknown command.\r\n");
     }
 }
 
-// SYSTEM B: Logic & Actuation
-// Goal: Pull SensorSnapshot -> Transform via pure logic -> Execute Hardware Action
-export fn actuator_system_task(arg: ?*anyopaque) callconv(.c) void {
-    _ = arg;
-    var current_snapshot: SensorSnapshot = undefined;
+// ============================================================================
+// MAIN TASK
+// ============================================================================
+export fn app_main() void {
+    uart.Terminal.init();
+    c.vTaskDelay(50);
 
-    const pump_duration_ticks = 20000 / idf.portTICK_PERIOD_MS;
-    const rest_duration_ticks = 40000 / idf.portTICK_PERIOD_MS;
-    const idle_duration_ticks = 60000 / idf.portTICK_PERIOD_MS;
+    // 1. ALLOCATE THE PHYSICAL SILICON CELLS (The .bss section)
+    // We claim exactly what we calculated we need.
+    var repl_memory_pool: [REPL_MEMORY_REQUIREMENT]u8 = undefined;
+
+    // 2. WRAP IT IN ZIG'S FBA
+    var fba = std.heap.FixedBufferAllocator.init(&repl_memory_pool);
+
+    // 3. INJECT THE ALLOCATOR INTO OUR STATE MACHINE
+    var repl_state = ReplState.init(fba.allocator());
+
+    uart.Terminal.print("\x1B[2J\x1B[H");
+    uart.Terminal.print("Zig Microkernel\r\nzig-cli> ");
+
+    var buffer: [MAX_CMD_LEN]u8 = undefined;
+    var buf_len: usize = 0;
 
     while (true) {
-        // Block until new data arrives in the pipeline.
-        if (idf.xQueueReceive(sensor_queue, &current_snapshot, idf.portMAX_DELAY) == idf.pdTRUE) {
-
-            // 1. Transform raw data into an actionable command
-            const command = evaluate_hydroponics_policy(current_snapshot.ph_value);
-
-            // 2. Execute the hardware mapping based purely on the data command
-            switch (command) {
-                .StartPumping => {
-                    idf.esp_log_write(idf.ESP_LOG_INFO, TAG, "Cmd: StartPumping (pH %.2f)\n", current_snapshot.ph_value);
-                    // GPIO ON
-                    idf.vTaskDelay(pump_duration_ticks);
-
-                    idf.esp_log_write(idf.ESP_LOG_INFO, TAG, "Cmd: WaitAndRest\n");
-                    // GPIO OFF
-                    idf.vTaskDelay(rest_duration_ticks);
-                },
-                .SystemIdle, .WaitAndRest => {
-                    idf.esp_log_write(idf.ESP_LOG_WARN, TAG, "Cmd: SystemIdle (pH %.2f)\n", current_snapshot.ph_value);
-                    // GPIO OFF
-                    idf.vTaskDelay(idle_duration_ticks);
-                },
+        if (uart.Terminal.readByte(0xffffffff)) |char| {
+            if (char == '\r' or char == '\n') {
+                execute_command(&repl_state, buffer[0..buf_len]);
+                buf_len = 0;
+                uart.Terminal.print("zig-cli> ");
+            } else if (char == 8 or char == 127) {
+                if (buf_len > 0) {
+                    buf_len -= 1;
+                    uart.Terminal.print("\x08 \x08");
+                }
+            } else if (char >= 32 and char <= 126) {
+                if (buf_len < buffer.len) {
+                    buffer[buf_len] = char;
+                    buf_len += 1;
+                    uart.Terminal.writeByte(char);
+                }
             }
         }
     }
-}
-
-// ============================================================================
-// 4. MAIN ENTRY (Wiring the pipeline together)
-// ============================================================================
-export fn app_main() void {
-    idf.esp_log_write(idf.ESP_LOG_INFO, "SYSTEM", "Booting DOD Pipeline...\n");
-
-    // Allocate the pipeline buffer (Queue of 5 snapshots)
-    sensor_queue = idf.xQueueCreate(5, @sizeOf(SensorSnapshot));
-    if (sensor_queue == null) {
-        idf.esp_log_write(idf.ESP_LOG_ERROR, "SYSTEM", "Failed to allocate pipeline.\n");
-        return;
-    }
-
-    // Spawn the discrete processing nodes
-    _ = idf.xTaskCreate(ingest_system_task, "ingest_node", 4096, null, 4, null);
-    _ = idf.xTaskCreate(actuator_system_task, "actuator_node", 4096, null, 5, null);
-
-    idf.vTaskDelete(null);
 }
