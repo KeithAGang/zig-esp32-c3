@@ -80,6 +80,8 @@ fn execute_command(state: *ReplState, cmd: []const u8) void {
 // MAIN TASK
 // ============================================================================
 export fn app_main() void {
+    const ascii_parser = @import("ascii_parser.zig");
+    var parser = ascii_parser.Parser{};
     uart.Terminal.init();
     c.vTaskDelay(50);
 
@@ -100,21 +102,47 @@ export fn app_main() void {
     var buf_len: usize = 0;
 
     while (true) {
+        // 1. Get raw byte from hardware
         if (uart.Terminal.readByte(0xffffffff)) |char| {
-            if (char == '\r' or char == '\n') {
-                execute_command(&repl_state, buffer[0..buf_len]);
-                buf_len = 0;
-                uart.Terminal.print("zig-cli> ");
-            } else if (char == 8 or char == 127) {
-                if (buf_len > 0) {
-                    buf_len -= 1;
-                    uart.Terminal.print("\x08 \x08");
-                }
-            } else if (char >= 32 and char <= 126) {
-                if (buf_len < buffer.len) {
-                    buffer[buf_len] = char;
-                    buf_len += 1;
-                    uart.Terminal.writeByte(char);
+
+            // 2. Transform raw byte into a semantic Event
+            if (parser.processByte(char)) |event| {
+
+                // 3. Handle the Event!
+                switch (event) {
+                    .printable => |letter| {
+                        if (buf_len < buffer.len) {
+                            buffer[buf_len] = letter;
+                            buf_len += 1;
+                            uart.Terminal.writeByte(letter);
+                        }
+                    },
+                    .enter => {
+                        execute_command(&repl_state, buffer[0..buf_len]);
+                        buf_len = 0;
+                        uart.Terminal.print("\nzig-cli> ");
+                    },
+                    .backspace => {
+                        if (buf_len > 0) {
+                            buf_len -= 1;
+                            uart.Terminal.print("\x08 \x08");
+                        }
+                    },
+                    .clear_screen => { // The Ctrl+L magic!
+                        uart.Terminal.print("\x1B[2J\x1B[H");
+                        uart.Terminal.print("zig-cli> ");
+                        // Re-print whatever they were currently typing
+                        uart.Terminal.print(buffer[0..buf_len]);
+                    },
+                    .up => {
+                        uart.Terminal.print("\r\n[TODO: Fetch older history]\r\nzig-cli> ");
+                    },
+                    .down => {
+                        uart.Terminal.print("\r\n[TODO: Fetch newer history]\r\nzig-cli> ");
+                    },
+                    .left, .right, .unsupported => {
+                        // Ignore for now
+                    },
                 }
             }
         }
