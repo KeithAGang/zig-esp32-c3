@@ -1,6 +1,7 @@
 const std = @import("std");
 const c = @import("idf_c.zig").c;
 const uart = @import("uart.zig");
+const drawWindow = @import("compositor.zig").drawWindow;
 
 extern "c" fn esp_get_free_heap_size() u32;
 
@@ -98,6 +99,10 @@ export fn app_main() void {
     uart.Terminal.print("\x1B[2J\x1B[H");
     uart.Terminal.print("Zig Microkernel\r\nzig-cli> ");
 
+    // 🔥 THE BAIT: Interrogate the terminal right before the loop starts!
+    // This forces the terminal to reply with its size, triggering your layout engine.
+    uart.Terminal.print("\x1B[999;999H\x1B[6n");
+
     var buffer: [MAX_CMD_LEN]u8 = undefined;
     var buf_len: usize = 0;
 
@@ -134,13 +139,33 @@ export fn app_main() void {
                         // Re-print whatever they were currently typing
                         uart.Terminal.print(buffer[0..buf_len]);
                     },
+                    .screen_size => |size| {
+                        // We just discovered the terminal size!
+                        // Let's clear the screen and draw a tiling window layout!
+                        uart.Terminal.print("\x1B[2J"); // Clear screen
+
+                        // Calculate a gap-based layout (The Hyprland signature)
+                        const gap = 2;
+                        const half_width = (size.cols / 2) - gap;
+
+                        // Draw Left Window (e.g., Rust App)
+                        drawWindow(gap, gap, half_width, size.rows - (gap * 2));
+
+                        // Draw Right Window (e.g., OS Logs)
+                        drawWindow(half_width + (gap * 2), gap, half_width, size.rows - (gap * 2));
+
+                        // Park the cursor safely at the bottom
+                        var buf: [32]u8 = undefined;
+                        const park_pos = std.fmt.bufPrint(&buf, "\x1B[{d};0H", .{size.rows}) catch return;
+                        uart.Terminal.print(park_pos);
+                    },
                     .up => {
                         uart.Terminal.print("\r\n[TODO: Fetch older history]\r\nzig-cli> ");
                     },
                     .down => {
                         uart.Terminal.print("\r\n[TODO: Fetch newer history]\r\nzig-cli> ");
                     },
-                    .left, .right, .unsupported => {
+                    .left, .right, .swap_window, .unsupported => {
                         // Ignore for now
                     },
                 }

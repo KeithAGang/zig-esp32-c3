@@ -2,6 +2,7 @@ build/
 zig-out/
 .zig-cache/
 __cmake_systeminformation/
+.vscode/
 
 sdkconfig
 sdkconfig.old
