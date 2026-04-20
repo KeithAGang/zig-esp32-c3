@@ -1,7 +1,8 @@
 const std = @import("std");
-const c = @import("idf_c.zig").c;
-const uart = @import("uart.zig");
-const drawWindow = @import("compositor.zig").drawWindow;
+const c = @import("idf_c/idf_c.zig").c;
+const Viewport = @import("viewport/viewport.zig").ViewPort;
+const uart = @import("uart/uart.zig");
+const drawWindow = @import("compositor/compositor.zig").drawWindow;
 
 extern "c" fn esp_get_free_heap_size() u32;
 
@@ -81,7 +82,7 @@ fn execute_command(state: *ReplState, cmd: []const u8) void {
 // MAIN TASK
 // ============================================================================
 export fn app_main() void {
-    const ascii_parser = @import("ascii_parser.zig");
+    const ascii_parser = @import("ascii_parser/ascii_parser.zig");
     var parser = ascii_parser.Parser{};
     uart.Terminal.init();
     c.vTaskDelay(50);
@@ -106,6 +107,8 @@ export fn app_main() void {
     var buffer: [MAX_CMD_LEN]u8 = undefined;
     var buf_len: usize = 0;
 
+    var left_window = Viewport.init(0, 0, 0, 0);
+
     while (true) {
         // 1. Get raw byte from hardware
         if (uart.Terminal.readByte(0xffffffff)) |char| {
@@ -119,18 +122,20 @@ export fn app_main() void {
                         if (buf_len < buffer.len) {
                             buffer[buf_len] = letter;
                             buf_len += 1;
-                            uart.Terminal.writeByte(letter);
+                            left_window.printChar(letter);
                         }
                     },
                     .enter => {
                         execute_command(&repl_state, buffer[0..buf_len]);
                         buf_len = 0;
-                        uart.Terminal.print("\nzig-cli> ");
+                        left_window.printChar('\n');
+                        left_window.printString("zig-cli> ");
                     },
                     .backspace => {
+                        // For now, backspace is tricky with viewports.
+                        // Let's just update the buffer memory but leave the visual alone until we add full redrawing.
                         if (buf_len > 0) {
                             buf_len -= 1;
-                            uart.Terminal.print("\x08 \x08");
                         }
                     },
                     .clear_screen => { // The Ctrl+L magic!
@@ -155,9 +160,20 @@ export fn app_main() void {
                         drawWindow(half_width + (gap * 2), gap, half_width, size.rows - (gap * 2));
 
                         // Park the cursor safely at the bottom
-                        var buf: [32]u8 = undefined;
-                        const park_pos = std.fmt.bufPrint(&buf, "\x1B[{d};0H", .{size.rows}) catch return;
-                        uart.Terminal.print(park_pos);
+                        //var buf: [32]u8 = undefined;
+                        //const park_pos = std.fmt.bufPrint(&buf, "\x1B[{d};0H", .{size.rows}) catch return;
+                        //uart.Terminal.print(park_pos);
+
+                        // Configure the Viewport
+                        // Start +1 inside the border, and make it -2 smaller than the border
+                        left_window.global_x = gap + 1;
+                        left_window.global_y = gap + 1;
+                        left_window.width = half_width - 2;
+                        left_window.height = (size.rows - (gap * 2)) - 2;
+
+                        // Reset its local state and print the prompt inside the box
+                        left_window.clear();
+                        left_window.printString("zig-cli> ");
                     },
                     .up => {
                         uart.Terminal.print("\r\n[TODO: Fetch older history]\r\nzig-cli> ");

@@ -1,4 +1,4 @@
-const uart = @import("uart.zig");
+const uart = @import("../uart/uart.zig");
 const std = @import("std");
 
 pub fn drawWindow(start_col: u16, start_row: u16, width: u16, height: u16) void {

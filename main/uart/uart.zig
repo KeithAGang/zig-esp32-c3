@@ -1,6 +1,6 @@
 // main/uart.zig
 const std = @import("std");
-const c = @import("idf_c.zig").c;
+const c = @import("../idf_c/idf_c.zig").c;
 
 // ============================================================================
 // MANUAL C BINDINGS (Bypassing driver/uart.h)
