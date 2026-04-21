@@ -13,6 +13,10 @@ extern "c" fn esp_get_free_heap_size() u32;
 const MAX_CMD_LEN = 64;
 const HISTORY_SIZE = 5;
 
+// 🔥 FIX 1: Move the physical memory pool OUTSIDE the function!
+// Now it lives safely in Static RAM (.bss), not on the tiny execution stack.
+var os_memory_pool: [32768]u8 = undefined;
+
 // The clay.h pattern: we know EXACTLY how many bytes this system needs.
 // 5 strings of 64 bytes = 320 bytes. We add a little overhead for the ArrayList pointers.
 const REPL_MEMORY_REQUIREMENT = (MAX_CMD_LEN * HISTORY_SIZE) + 128;
@@ -56,25 +60,25 @@ const ReplState = struct {
 // ============================================================================
 // COMMAND PARSER
 // ============================================================================
-fn execute_command(state: *ReplState, cmd: []const u8) void {
+fn execute_command(state: *ReplState, cmd: []const u8, window: *Viewport) void {
     if (cmd.len == 0) return;
 
     // Save every valid command to our FBA-backed history
     state.saveCommand(cmd);
 
     if (std.mem.eql(u8, cmd, "help")) {
-        uart.Terminal.print("\r\nCommands: help, free, history, clear\r\n");
+        window.printString("Commands: help, free, history, clear\n");
     } else if (std.mem.eql(u8, cmd, "history")) {
         state.printHistory();
     } else if (std.mem.eql(u8, cmd, "free")) {
         const free_ram = esp_get_free_heap_size();
         var buf: [64]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "\r\nFree OS Heap: {d} bytes\r\n", .{free_ram}) catch "";
-        uart.Terminal.print(msg);
+        const msg = std.fmt.bufPrint(&buf, "Free OS Heap: {d} bytes\n", .{free_ram}) catch "";
+        window.printString(msg);
     } else if (std.mem.eql(u8, cmd, "clear")) {
-        uart.Terminal.print("\x1B[2J\x1B[H");
+        window.printString("\x1B[2J\x1B[H");
     } else {
-        uart.Terminal.print("\r\nUnknown command.\r\n");
+        window.printString("Unknown command.\n");
     }
 }
 
@@ -87,12 +91,7 @@ export fn app_main() void {
     uart.Terminal.init();
     c.vTaskDelay(50);
 
-    // 1. ALLOCATE THE PHYSICAL SILICON CELLS (The .bss section)
-    // We claim exactly what we calculated we need.
-    var repl_memory_pool: [REPL_MEMORY_REQUIREMENT]u8 = undefined;
-
-    // 2. WRAP IT IN ZIG'S FBA
-    var fba = std.heap.FixedBufferAllocator.init(&repl_memory_pool);
+    var fba = std.heap.FixedBufferAllocator.init(&os_memory_pool);
 
     // 3. INJECT THE ALLOCATOR INTO OUR STATE MACHINE
     var repl_state = ReplState.init(fba.allocator());
@@ -107,7 +106,7 @@ export fn app_main() void {
     var buffer: [MAX_CMD_LEN]u8 = undefined;
     var buf_len: usize = 0;
 
-    var left_window = Viewport.init(0, 0, 0, 0);
+    var left_window = Viewport.init(fba.allocator());
 
     while (true) {
         // 1. Get raw byte from hardware
@@ -126,28 +125,31 @@ export fn app_main() void {
                         }
                     },
                     .enter => {
-                        execute_command(&repl_state, buffer[0..buf_len]);
-                        buf_len = 0;
                         left_window.printChar('\n');
+                        execute_command(&repl_state, buffer[0..buf_len], &left_window);
+                        buf_len = 0;
+                        //left_window.printChar('\n');
                         left_window.printString("zig-cli> ");
                     },
                     .backspace => {
-                        // For now, backspace is tricky with viewports.
-                        // Let's just update the buffer memory but leave the visual alone until we add full redrawing.
                         if (buf_len > 0) {
                             buf_len -= 1;
+                            // Tell the Viewport to erase the letter!
+                            left_window.backspace();
                         }
                     },
                     .clear_screen => { // The Ctrl+L magic!
-                        uart.Terminal.print("\x1B[2J\x1B[H");
-                        uart.Terminal.print("zig-cli> ");
+                        // uart.Terminal.print("\x1B[2J\x1B[H");
+                        // uart.Terminal.print("zig-cli> ");
                         // Re-print whatever they were currently typing
-                        uart.Terminal.print(buffer[0..buf_len]);
+                        left_window.clear();
+                        left_window.printString(buffer[0..buf_len]);
                     },
                     .screen_size => |size| {
                         // We just discovered the terminal size!
                         // Let's clear the screen and draw a tiling window layout!
                         uart.Terminal.print("\x1B[2J"); // Clear screen
+                        left_window.clear();
 
                         // Calculate a gap-based layout (The Hyprland signature)
                         const gap = 2;
@@ -159,20 +161,18 @@ export fn app_main() void {
                         // Draw Right Window (e.g., OS Logs)
                         drawWindow(half_width + (gap * 2), gap, half_width, size.rows - (gap * 2));
 
-                        // Park the cursor safely at the bottom
-                        //var buf: [32]u8 = undefined;
-                        //const park_pos = std.fmt.bufPrint(&buf, "\x1B[{d};0H", .{size.rows}) catch return;
-                        //uart.Terminal.print(park_pos);
+                        // THE RESPONSIVE TRIGGER
+                        // This frees the old arrays and perfectly allocates the new ones!
+                        const target_x = gap + 1;
+                        const target_y = gap + 1;
+                        const target_w = half_width - 2;
+                        const target_h = (size.rows - (gap * 2)) - 2;
 
-                        // Configure the Viewport
-                        // Start +1 inside the border, and make it -2 smaller than the border
-                        left_window.global_x = gap + 1;
-                        left_window.global_y = gap + 1;
-                        left_window.width = half_width - 2;
-                        left_window.height = (size.rows - (gap * 2)) - 2;
+                        left_window.resize(target_x, target_y, target_w, target_h) catch {
+                            uart.Terminal.print("OOM Error!\n");
+                            continue;
+                        };
 
-                        // Reset its local state and print the prompt inside the box
-                        left_window.clear();
                         left_window.printString("zig-cli> ");
                     },
                     .up => {
@@ -185,6 +185,8 @@ export fn app_main() void {
                         // Ignore for now
                     },
                 }
+
+                left_window.flush();
             }
         }
     }

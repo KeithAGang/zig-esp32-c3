@@ -14,14 +14,52 @@ pub const ViewPort = struct {
     local_x: u16 = 0,
     local_y: u16 = 0,
 
-    // Initialize with bounds
-    pub fn init(x: u16, y: u16, w: u16, h: u16) ViewPort {
+    // RESPONSIVE MEMORY: Zig Slices instead of fixed arrays
+    current_buf: []u8 = &[_]u8{},
+    prev_buf: []u8 = &[_]u8{},
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) ViewPort {
         return .{
-            .global_x = x,
-            .global_y = y,
-            .width = w,
-            .height = h,
+            .allocator = allocator,
         };
+    }
+
+    // THE RESIZER: Call this whenever clay.h changes the window size!
+    pub fn resize(self: *ViewPort, x: u16, y: u16, new_w: u16, new_h: u16) !void {
+        self.global_x = x;
+        self.global_y = y;
+
+        // If the size didn't change, just clear it and return
+        if (self.width == new_w and self.height == new_h) {
+            self.clear();
+            return;
+        }
+
+        // 1. Free the old memory to prevent leaks
+        if (self.current_buf.len > 0) {
+            self.allocator.free(self.current_buf);
+            self.allocator.free(self.prev_buf);
+        }
+
+        // 2. Ask the FBA for exact new memory size (Width * Height)
+        const size = @as(usize, new_w) * @as(usize, new_h);
+        self.current_buf = try self.allocator.alloc(u8, size);
+        self.prev_buf = try self.allocator.alloc(u8, size);
+
+        self.width = new_w;
+        self.height = new_h;
+        self.local_x = 0;
+        self.local_y = 0;
+
+        // 3. Fill current with spaces, prev with 0 (to force a full redraw on next flush)
+        @memset(self.current_buf, ' ');
+        @memset(self.prev_buf, ' ');
+    }
+
+    // Helper function to find the 1D index for a 2D coordinate
+    fn getIdx(self: *ViewPort, x: u16, y: u16) usize {
+        return (@as(usize, y) * @as(usize, self.width)) + @as(usize, x);
     }
 
     pub fn newLine(self: *ViewPort) void {
@@ -50,17 +88,11 @@ pub const ViewPort = struct {
             self.newLine();
         }
 
-        // 3. The Translator: Local -> Global
-        const absolute_x = self.global_x + self.local_x;
-        const absolute_y = self.global_y + self.local_y;
-
-        // 4. Teleport the physical cursor and print
-        var buf: [32]u8 = undefined;
-        const cmd = std.fmt.bufPrint(&buf, "\x1B[{d};{d}H{c}", .{ absolute_y, absolute_x, char }) catch return;
-        uart.Terminal.print(cmd);
-
-        // 5. Advance our local math
-        self.local_x += 1;
+        // Save to the 1D slice!
+        if (self.current_buf.len > 0) {
+            self.current_buf[self.getIdx(self.local_x, self.local_y)] = char;
+            self.local_x += 1;
+        }
     }
 
     pub fn printString(self: *ViewPort, text: []const u8) void {
@@ -69,22 +101,44 @@ pub const ViewPort = struct {
         }
     }
 
+    pub fn backspace(self: *ViewPort) void {
+        // Only backspace if we aren't at the very left edge
+        if (self.local_x > 0) {
+            self.local_x -= 1;
+            // Overwrite the character in our RAM slice with a space
+            self.current_buf[self.getIdx(self.local_x, self.local_y)] = ' ';
+        }
+    }
+
     pub fn clear(self: *ViewPort) void {
         self.local_x = 0;
         self.local_y = 0;
 
-        // Overwrite the inside of our box with spaces, without touching the borders!
-        var buf: [32]u8 = undefined;
-        for (0..self.height) |row| {
-            const absolute_y = self.global_y + @as(u16, @intCast(row));
-            const cmd = std.fmt.bufPrint(&buf, "\x1B[{d};{d}H", .{ absolute_y, self.global_x }) catch return;
-            uart.Terminal.print(cmd);
-
-            for (0..self.width) |_| uart.Terminal.print(" ");
+        if (self.current_buf.len > 0) {
+            @memset(self.current_buf, ' '); // Instantly wipes the RAM buffer
         }
+    }
 
-        // Put cursor back at Local (0,0)
-        const reset_cmd = std.fmt.bufPrint(&buf, "\x1B[{d};{d}H", .{ self.global_y, self.global_x }) catch return;
-        uart.Terminal.print(reset_cmd);
+    pub fn flush(self: *ViewPort) void {
+        if (self.current_buf.len == 0) return;
+        var buf: [32]u8 = undefined;
+
+        for (0..self.height) |y| {
+            for (0..self.width) |x| {
+                const idx = self.getIdx(@intCast(x), @intCast(y));
+                const current_char = self.current_buf[idx];
+                const prev_char = self.prev_buf[idx];
+
+                if (current_char != prev_char) {
+                    const absolute_x = self.global_x + @as(u16, @intCast(x));
+                    const absolute_y = self.global_y + @as(u16, @intCast(y));
+
+                    const cmd = std.fmt.bufPrint(&buf, "\x1B[{d};{d}H{c}", .{ absolute_y, absolute_x, current_char }) catch continue;
+                    uart.Terminal.print(cmd);
+
+                    self.prev_buf[idx] = current_char;
+                }
+            }
+        }
     }
 };
