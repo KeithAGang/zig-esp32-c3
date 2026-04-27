@@ -47,12 +47,12 @@ const ReplState = struct {
         self.history.append(self.allocator, cmd_copy) catch return;
     }
 
-    pub fn printHistory(self: *ReplState) void {
-        uart.Terminal.print("\r\n--- Command History ---\r\n");
+    pub fn printHistory(self: *ReplState, window: *Viewport) void {
+        window.printString("\r\n--- Command History ---\r\n");
         for (self.history.items, 0..) |cmd, i| {
             var buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "[{d}] {s}\r\n", .{ i, cmd }) catch continue;
-            uart.Terminal.print(msg);
+            window.printString(msg);
         }
     }
 };
@@ -69,14 +69,14 @@ fn execute_command(state: *ReplState, cmd: []const u8, window: *Viewport) void {
     if (std.mem.eql(u8, cmd, "help")) {
         window.printString("Commands: help, free, history, clear\n");
     } else if (std.mem.eql(u8, cmd, "history")) {
-        state.printHistory();
+        state.printHistory(window);
     } else if (std.mem.eql(u8, cmd, "free")) {
         const free_ram = esp_get_free_heap_size();
         var buf: [64]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "Free OS Heap: {d} bytes\n", .{free_ram}) catch "";
         window.printString(msg);
     } else if (std.mem.eql(u8, cmd, "clear")) {
-        window.printString("\x1B[2J\x1B[H");
+        window.clear();
     } else {
         window.printString("Unknown command.\n");
     }
@@ -138,12 +138,10 @@ export fn app_main() void {
                             left_window.backspace();
                         }
                     },
-                    .clear_screen => { // The Ctrl+L magic!
-                        // uart.Terminal.print("\x1B[2J\x1B[H");
-                        // uart.Terminal.print("zig-cli> ");
-                        // Re-print whatever they were currently typing
-                        left_window.clear();
-                        left_window.printString(buffer[0..buf_len]);
+                    .clear_screen => {
+                        // 2. The ONLY thing Ctrl+L should do is throw the bait!
+                        // This forces the terminal to reply, which triggers .screen_size
+                        uart.Terminal.print("\x1B[999;999H\x1B[6n");
                     },
                     .screen_size => |size| {
                         // We just discovered the terminal size!
@@ -173,7 +171,9 @@ export fn app_main() void {
                             continue;
                         };
 
+                        // Restore the prompt AND whatever they were typing
                         left_window.printString("zig-cli> ");
+                        left_window.printString(buffer[0..buf_len]);
                     },
                     .up => {
                         uart.Terminal.print("\r\n[TODO: Fetch older history]\r\nzig-cli> ");

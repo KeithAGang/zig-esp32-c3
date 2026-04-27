@@ -33,6 +33,8 @@ pub const ViewPort = struct {
         // If the size didn't change, just clear it and return
         if (self.width == new_w and self.height == new_h) {
             self.clear();
+
+            if (self.prev_buf.len > 0) @memset(self.prev_buf, ' ');
             return;
         }
 
